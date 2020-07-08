@@ -54,6 +54,26 @@ def split_feature(tensor, type="split"):
     elif type == "cross":
         return tensor[:, 0::2, ...], tensor[:, 1::2, ...]
 
+def split_feature_weight_diff(tensor, type="split"):
+    """
+    type = ["split", "cross"]
+    """
+    C = tensor.size(1)
+    if type == "split":
+        return tensor[:, :C // 2, ...], tensor.ones_like(tensor[:, C // 2:, ...]) * (-5.)# logstd = should be 0.01 or 0.1
+    elif type == "cross":
+        return tensor[:, 0::2, ...], tensor[:, 1::2, ...]
+
+def split_linear_feature(tensor, type="split"):
+    """
+    type = ["split", "cross"]
+    """
+    C = tensor.size(1)
+    if type == "split":
+        return tensor[:, :C // 2], tensor[:, C // 2:]
+    elif type == "cross":
+        return tensor[:, 0::2], tensor[:, 1::2]
+
 
 def cat_feature(tensor_a, tensor_b):
     return torch.cat((tensor_a, tensor_b), dim=1)
@@ -61,3 +81,6 @@ def cat_feature(tensor_a, tensor_b):
 
 def pixels(tensor):
     return int(tensor.size(2) * tensor.size(3))
+
+def pixels2(tensor):
+    return int(tensor.size(1)* tensor.size(2) * tensor.size(3))

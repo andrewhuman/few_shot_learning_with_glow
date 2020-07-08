@@ -6,6 +6,8 @@ from tqdm import tqdm
 from . import thops
 from . import modules
 from . import utils
+from . import metrics
+#from metrics import ArcMarginProduct
 
 
 def f(in_channels, out_channels, hidden_channels):
@@ -34,7 +36,7 @@ class FlowStep(nn.Module):
         assert flow_permutation in FlowStep.FlowPermutation,\
             "float_permutation should be in `{}`".format(
                 FlowStep.FlowPermutation.keys())
-        super().__init__()
+        super(FlowStep,self).__init__()
         self.flow_permutation = flow_permutation
         self.flow_coupling = flow_coupling
         # 1. actnorm
@@ -107,7 +109,9 @@ class FlowNet(nn.Module):
                  actnorm_scale=1.0,
                  flow_permutation="invconv",
                  flow_coupling="additive",
-                 LU_decomposed=False):
+                 LU_decomposed=False,
+                 is_split_2d = False,
+                 split2d_type=1):
         """
                              K                                      K
         --> [Squeeze] -> [FlowStep] -> [Split] -> [Squeeze] -> [FlowStep]
@@ -115,7 +119,7 @@ class FlowNet(nn.Module):
                |          (L - 1)          |
                + --------------------------+
         """
-        super().__init__()
+        super(FlowNet,self).__init__()
         self.layers = nn.ModuleList()
         self.output_shapes = []
         self.K = K
@@ -140,8 +144,8 @@ class FlowNet(nn.Module):
                 self.output_shapes.append(
                     [-1, C, H, W])
             # 3. Split2d
-            if i < L - 1:
-                self.layers.append(modules.Split2d(num_channels=C))
+            if is_split_2d and i < L - 1:
+                self.layers.append(modules.Split2d(num_channels=C,split2d_type=split2d_type))
                 self.output_shapes.append([-1, C // 2, H, W])
                 C = C // 2
 
@@ -155,7 +159,7 @@ class FlowNet(nn.Module):
         i = 0
         for layer, shape in zip(self.layers, self.output_shapes):
             # print(str(i),': z.size = ',z.size())
-            # print(str(i),': logdet size = ', logdet.size(),logdet[:5])
+            # print(str(i),': logdet size = ', logdet.size())
             i+=1
             z, logdet = layer(z, logdet, reverse=False)
         return z, logdet
@@ -184,18 +188,26 @@ class Glow(nn.Module):
     BCE = nn.BCEWithLogitsLoss()
     CE = nn.CrossEntropyLoss()
 
-    def __init__(self, hparams):
-        super().__init__()
+    def __init__(self, hparams,test_class_index,is_mean,K,y_classes,is_split_2d = False,is_prior_total= False,is_prior_wh= False,z_add_random = True,arc_loss = False,split2d_type=1):
+        super(Glow,self).__init__()
         self.flow = FlowNet(image_shape=hparams.Glow.image_shape,
                             hidden_channels=hparams.Glow.hidden_channels,
-                            K=hparams.Glow.K,
+                            K=K,
                             L=hparams.Glow.L,
                             actnorm_scale=hparams.Glow.actnorm_scale,
                             flow_permutation=hparams.Glow.flow_permutation,
                             flow_coupling=hparams.Glow.flow_coupling,
-                            LU_decomposed=hparams.Glow.LU_decomposed)
+                            LU_decomposed=hparams.Glow.LU_decomposed,
+                            is_split_2d=is_split_2d,
+                            split2d_type =split2d_type)
         self.hparams = hparams
-        self.y_classes = hparams.Glow.y_classes
+        self.test_class_index = test_class_index
+        self.y_classes = y_classes
+        self.is_mean = is_mean
+        self.is_prior_total = is_prior_total
+        self.is_prior_wh = is_prior_wh
+        self.z_add_random =z_add_random
+        self.arc_loss = arc_loss
         # for prior
         if hparams.Glow.learn_top:
             C = self.flow.output_shapes[-1][1]
@@ -203,40 +215,146 @@ class Glow(nn.Module):
         if hparams.Glow.y_condition:
             # c = out layer channel = 48 or
             C = self.flow.output_shapes[-1][1]
-            self.project_ycond = modules.LinearZeros(
-                hparams.Glow.y_classes, 2 * C)
-            self.project_class = modules.LinearZeros(
-                C, hparams.Glow.y_classes)
-        # register prior hidden
-        num_device = len(utils.get_proper_device(hparams.Device.glow, False))
-        assert hparams.Train.batch_size % num_device == 0
-        self.register_parameter(
-            "prior_h",
-            nn.Parameter(torch.zeros([hparams.Train.batch_size // num_device,
-                                      self.flow.output_shapes[-1][1] * 2,
-                                      self.flow.output_shapes[-1][2],
-                                      self.flow.output_shapes[-1][3]])))
 
-    def prior(self, y_onehot=None):
+            self.project_ycond = modules.LinearZeros(
+                self.y_classes, 2 * C )
+
+            if self.is_prior_wh:
+                self.project_ycond_wh = modules.LinearZeros(
+                    self.y_classes, 2 * C * self.flow.output_shapes[-1][2] * self.flow.output_shapes[-1][3])
+
+            if is_prior_total:
+                self.project_ycond_total = modules.LinearZeros(
+                    1, 2 * C)
+
+            if self.is_mean:
+                self.C_project_class = C
+            else :
+                self.C_project_class = C * self.flow.output_shapes[-1][2] * self.flow.output_shapes[-1][3]
+
+            if self.arc_loss :
+                self.metric_fc = metrics.ArcMarginProduct(self.C_project_class, self.y_classes, s=30, m=0.5)
+            else:
+                self.project_class = modules.LinearZeros(
+                    self.C_project_class, self.y_classes)
+
+
+
+
+        # register prior hidden
+        # num_device = len(utils.get_proper_device(hparams.Device.glow, False))
+        # assert hparams.Train.batch_size % num_device == 0
+        # self.register_parameter(
+        #     "prior_h",
+        #     nn.Parameter(torch.zeros([hparams.Train.batch_size, # // num_device
+        #                               self.flow.output_shapes[-1][1] * 2,
+        #                               self.flow.output_shapes[-1][2],
+        #                               self.flow.output_shapes[-1][3]])))
+
+    def set_z_add_random(self,z_add_random):
+        self.z_add_random = z_add_random
+
+    def prior(self ,shape , y_onehot=None):
         # print('prior_h size = ',self.prior_h.size())
         # print('learn_top size = ', self.learn_top.size())
         # print('project_ycond size = ', self.project_ycond.size())
-
+        self.prior_h = torch.zeros(shape).cuda()  # if gpu or cpu
         B, C = self.prior_h.size(0), self.prior_h.size(1)
         h = self.prior_h.detach().clone()
         assert torch.sum(h) == 0.0
+        # print('before learn_top ,torch.sum(h) = ', torch.sum(h))  # sum h  = 0
         # print('h sum = ', torch.sum(h))
         if self.hparams.Glow.learn_top:
             h = self.learn_top(h)
-            # print('learn_top h size = ', h.size())
+            # print('self.learn_top.weight.data = ',self.learn_top.weight.data)
+            # print('after learn_top ,torch.sum(h) = ', torch.sum(h)) # learn top sum h  = 0
+            # print('learn_top weight requre grad = ', self.learn_top.weight.requires_grad)
         if self.hparams.Glow.y_condition:
             assert y_onehot is not None
             # print('y_onehot size = ',y_onehot.size())
             # print('self.project_ycond weight size = ',self.project_ycond.weight.size())
 
+            # y_onehot = [batch ,class] , weight = [class , 2c], yp = [b,2c] , 2c = C
+            if self.is_prior_wh:
+                yp = self.project_ycond_wh(y_onehot).view(*shape)
+            else:
+                yp = self.project_ycond(y_onehot).view(B, C, 1, 1)
 
-            yp = self.project_ycond(y_onehot).view(B, C, 1, 1)
+            # print('after y_condition ,yp size = ', yp.size())
+
             h += yp
+
+
+
+            # print('y_condition h size = ', h.size())
+        return thops.split_feature(h, "split")
+    def get_log_mean_var(self,batch_size,y_onehot):
+
+
+        shape = (batch_size, self.flow.output_shapes[-1][1] * 2, self.flow.output_shapes[-1][2],
+                 self.flow.output_shapes[-1][3])
+        print("get_log_mean_var ,shape = ", shape)
+
+        # print('prior_h size = ',self.prior_h.size())
+
+        prior_mean = torch.zeros(shape).cuda()  # if gpu or cpu
+        B, C = prior_mean.size(0), prior_mean.size(1)
+        h = prior_mean.detach().clone()
+        print('get_log_mean_var y_condition h size = ', h.size())
+        assert torch.sum(h) == 0.0
+        # print('torch.sum(h) init = ', torch.sum(h))
+        # print('h sum = ', torch.sum(h))
+        if self.hparams.Glow.learn_top:
+            h = self.learn_top(h)
+            # print('self.learn_top.weight.data = ',self.learn_top.weight.data)
+            # print('after learn_top ,torch.sum(h) = ', torch.sum(h))
+            # print('learn_top weight requre grad = ', self.learn_top.weight.requires_grad)
+        if self.hparams.Glow.y_condition:
+            assert y_onehot is not None
+            # print('y_onehot size = ',y_onehot.size())
+            # print('self.project_ycond weight size = ',self.project_ycond.weight.size())
+
+            # y_onehot = [batch ,class] , weight = [class , 2c], yp = [b,2c] , 2c = C
+            if self.is_prior_wh:
+                yp = self.project_ycond_wh(y_onehot).view(*shape)
+            else:
+                yp = self.project_ycond(y_onehot).view(B, C, 1, 1)
+
+            h += yp
+            # print('after y_condition ,torch.sum(h) = ', torch.sum(h))
+
+            print('get_log_mean_var y_condition h size = ', h.size())
+        return thops.split_feature(h, "split")
+
+
+
+    def prior_t(self ,shape):
+        # print('prior_h size = ',self.prior_h.size())
+        # print('learn_top size = ', self.learn_top.size())
+        # print('project_ycond size = ', self.project_ycond.size())
+        self.prior_total = torch.zeros(shape).cuda()  # if gpu or cpu
+        self.batch_one = torch.ones((shape[0],1)).cuda()
+        B, C = self.prior_total.size(0), self.prior_total.size(1)
+        h = self.prior_total.detach().clone()
+        assert torch.sum(h) == 0.0
+        # print('torch.sum(h) init = ', torch.sum(h))
+        # print('h sum = ', torch.sum(h))
+        # if self.hparams.Glow.learn_top:
+        #     h = self.learn_top(h)
+        #     # print('self.learn_top.weight.data = ',self.learn_top.weight.data)
+        #     # print('after learn_top ,torch.sum(h) = ', torch.sum(h))
+        #     print('learn_top weight requre grad = ', self.learn_top.weight.requires_grad)
+        if self.hparams.Glow.y_condition:
+            # assert y_onehot is not None
+            # print('y_onehot size = ',y_onehot.size())
+            # print('self.project_ycond weight size = ',self.project_ycond.weight.size())
+
+            # y_onehot = [batch ,1] , weight = [1 , 2c], yp = [b,2c] , 2c = C
+            yp = self.project_ycond_total(self.batch_one).view(B, C, 1, 1)
+
+            h += yp
+            # print('after y_condition ,torch.sum(h) = ', torch.sum(h))
+
 
             # print('y_condition h size = ', h.size())
         return thops.split_feature(h, "split")
@@ -248,10 +366,45 @@ class Glow(nn.Module):
         else:
             return self.reverse_flow(z, y_onehot, eps_std)
 
+    def class_flow(self,z,y_one_shot = None):
+
+        if self.hparams.Glow.y_condition:
+            if self.is_mean:
+                z_mean = z.mean(2).mean(2)
+            else:
+                z_mean = z.view(-1,self.C_project_class) # this have bugs ?
+            # print("z_mean shape = ",z_mean.size())
+
+            if self.arc_loss:
+                y_logits = self.metric_fc(z_mean,y_one_shot)
+            else:
+                if self.training:
+                    y_logits = self.project_class(z_mean)
+                else:
+                    weight = self.project_class.weight[self.test_class_index]
+                    bias = self.project_class.bias[self.test_class_index]
+                    y_logits = torch.add(torch.matmul(z_mean, torch.t(weight)), bias)
+
+
+
+        else:
+                y_logits = None
+
+        return y_logits
+
+
     def normal_flow(self, x, y_onehot):
+
+        # pixels = w * h
         pixels = thops.pixels(x)
-        z = x + torch.normal(mean=torch.zeros_like(x),
+
+        # z = x
+        # if self.training:
+        if self.z_add_random:
+            z = x + torch.normal(mean=torch.zeros_like(x),
                              std=torch.ones_like(x) * (1. / 256.))
+        else:
+            z = x
 
         logdet = torch.zeros_like(x[:, 0, 0, 0])
         # print('init logdet shape =',logdet.size())
@@ -261,27 +414,47 @@ class Glow(nn.Module):
         z, objective = self.flow(z, logdet=logdet, reverse=False)
 
         # prior
-        mean, logs = self.prior(y_onehot)
-        objective += modules.GaussianDiag.logp(mean, logs, z)
+        if self.training:
 
-        if self.hparams.Glow.y_condition:
-            z_mean = z.mean(2).mean(2)
-            # print("z_mean shape = ",z_mean.size())
-            y_logits = self.project_class(z_mean)
-        else:
-            y_logits = None
+            mean, logs = self.prior([z.size()[0],z.size()[1]*2,z.size()[2],z.size()[3]],y_onehot)
+            objective += modules.GaussianDiag.logp(mean, logs, z)
+
+
+        if self.is_prior_total:
+            mean_total, logs_total = self.prior_t([z.size()[0], z.size()[1] * 2, z.size()[2], z.size()[3]])
+            # print('after prior mean = ',mean)
+            # print('after prior logs = ', logs)
+            objective += modules.GaussianDiag.logp(mean_total, logs_total, z)
+
+
+        # if self.hparams.Glow.y_condition:
+        #     if self.is_mean:
+        #         z_mean = z.mean(2).mean(2)
+        #     else:
+        #         z_mean = z.view(-1,self.C_project_class)
+        #     # print("z_mean shape = ",z_mean.size())
+        #
+        #     if self.training:
+        #         y_logits = self.project_class(z_mean)
+        #     else:
+        #         weight = self.project_class.weight[self.test_class_index]
+        #         bias = self.project_class.bias[self.test_class_index]
+        #         y_logits = torch.add(torch.matmul(z_mean, torch.t(weight)), bias)
+        #
+        # else:
+        #         y_logits = None
 
         # return
         nll = (-objective) / float(np.log(2.) * pixels)
 
         # print('end z size =', z.size())
         # print('end y_logits =', y_logits.size())
-        # print('end nll value =', nll)
-        return z, nll, y_logits
+        # print('end nll value =', nll.size())
+        return z, nll
 
     def reverse_flow(self, z, y_onehot, eps_std):
         with torch.no_grad():
-            mean, logs = self.prior(y_onehot)
+            mean, logs = self.prior([z.size()[0],z.size()[1]*2,z.size()[2],z.size()[3]],y_onehot)
             if z is None:
                 z = modules.GaussianDiag.sample(mean, logs, eps_std)
             x = self.flow(z, eps_std=eps_std, reverse=True)
